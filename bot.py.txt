@@ -1,0 +1,224 @@
+import os
+import json
+from datetime import datetime
+
+import gspread
+from google.oauth2.service_account import Credentials
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+# ---------------------------
+# GOOGLE SHEETS
+# ---------------------------
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds_dict = json.loads(os.environ["GOOGLE_CREDS"])
+
+credentials = Credentials.from_service_account_info(
+    creds_dict,
+    scopes=SCOPES
+)
+
+gc = gspread.authorize(credentials)
+
+SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+
+sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Orders")
+
+# ---------------------------
+# TELEGRAM
+# ---------------------------
+
+user_data_store = {}
+
+PAYMENT_OPTIONS = [
+    "Invoice Sent",
+    "Unpaid",
+    "Paid",
+    "Partly Paid"
+]
+
+DELIVERY_OPTIONS = [
+    "Yes",
+    "No"
+]
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Welcome.\nUse /neworder to create a delivery order."
+    )
+
+
+async def neworder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    user_data_store[user_id] = {}
+
+    await update.message.reply_text(
+        "Customer Name?"
+    )
+
+    context.user_data["step"] = "customer"
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if "step" not in context.user_data:
+        return
+
+    text = update.message.text
+
+    step = context.user_data["step"]
+
+    if step == "customer":
+        user_data_store[user_id]["customer"] = text
+        context.user_data["step"] = "shop"
+
+        await update.message.reply_text(
+            "Shop / Boat?"
+        )
+
+    elif step == "shop":
+        user_data_store[user_id]["shop"] = text
+        context.user_data["step"] = "kg"
+
+        await update.message.reply_text(
+            "Kg Ordered?"
+        )
+
+    elif step == "kg":
+        user_data_store[user_id]["kg"] = text
+        context.user_data["step"] = "rate"
+
+        await update.message.reply_text(
+            "Rate?"
+        )
+
+    elif step == "rate":
+        user_data_store[user_id]["rate"] = text
+
+        keyboard = [
+            [InlineKeyboardButton(x, callback_data=f"payment|{x}")]
+            for x in PAYMENT_OPTIONS
+        ]
+
+        await update.message.reply_text(
+            "Payment Status?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+        context.user_data["step"] = "payment"
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    data = query.data
+
+    if data.startswith("payment|"):
+
+        payment = data.split("|")[1]
+
+        user_data_store[user_id]["payment"] = payment
+
+        keyboard = [
+            [InlineKeyboardButton(x, callback_data=f"delivered|{x}")]
+            for x in DELIVERY_OPTIONS
+        ]
+
+        await query.edit_message_text(
+            f"Payment Status: {payment}"
+        )
+
+        await query.message.reply_text(
+            "Delivered?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data.startswith("delivered|"):
+
+        delivered = data.split("|")[1]
+
+        user_data_store[user_id]["delivered"] = delivered
+
+        order = user_data_store[user_id]
+
+        kg = float(order["kg"])
+        rate = float(order["rate"])
+
+        total = kg * rate
+
+        row = [
+            datetime.now().strftime("%d-%b-%Y"),
+            order["customer"],
+            order["shop"],
+            kg,
+            rate,
+            total,
+            order["payment"],
+            delivered
+        ]
+
+        sheet.append_row(row)
+
+        await query.edit_message_text(
+            f"Delivered: {delivered}"
+        )
+
+        await query.message.reply_text(
+            f"✅ Order saved.\n\n"
+            f"Customer: {order['customer']}\n"
+            f"Kg: {kg}\n"
+            f"Rate: {rate}\n"
+            f"Total: {total}"
+        )
+
+        user_data_store.pop(user_id, None)
+        context.user_data.clear()
+
+
+def main():
+    token = os.environ["TELEGRAM_TOKEN"]
+
+    app = Application.builder().token(token).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("neworder", neworder))
+
+    app.add_handler(
+        CallbackQueryHandler(button_handler)
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_message
+        )
+    )
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
